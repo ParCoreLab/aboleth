@@ -1,0 +1,30 @@
+# Environments and toolchains
+.tools/
+.torch-cache/
+.triton/
+.uv/
+.venv/
+.venv-efa/
+.dsl/
+.direct-deps/
+
+# Build outputs
+__pycache__/
+build/
+build-*/
+.cache/
+.goldens/
+.bench-cache/
+python/aboleth/_runtime*.so
+python/aboleth/lib*.so
+python/aboleth/*.bc
+
+# Run outputs
+experiments/results/
+experiments/triton-dump/
+aboleth-matrix-*.log
+cutlass_*.cubin
+cutlass_*.o
+cutlass_*.ptx
+*.nsys-rep
+*.sqlite

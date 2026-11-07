@@ -1,0 +1,10 @@
+cmake==3.31.10
+kernels==0.16.0
+lit==18.1.8
+nanobind==2.10.2
+ninja==1.13.0
+numpy==2.5.1
+pybind11==3.0.4
+setuptools==83.0.0
+torch==2.13.0
+wheel==0.47.0

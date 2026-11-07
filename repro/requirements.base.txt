@@ -1,0 +1,16 @@
+--extra-index-url https://download.pytorch.org/whl/cu126
+
+cmake==3.31.10
+cuda-bindings==12.9.4
+cuda-pathfinder==1.2.2
+kernels==0.16.0
+lit==18.1.8
+nanobind==2.10.2
+ninja==1.13.0
+numpy==2.5.1
+nvidia-nvshmem-cu12==3.4.5
+pip
+pybind11==3.0.4
+setuptools
+torch==2.13.0+cu126
+wheel

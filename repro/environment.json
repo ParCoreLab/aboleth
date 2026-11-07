@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-07-12T00:56:00+04:00",
+  "project": {
+    "name": "aboleth",
+    "archive_root": "aboleth",
+    "source_control": "Git repository with pinned upstream Triton submodule"
+  },
+  "host": {
+    "os": "Ubuntu 24.04.4 LTS",
+    "kernel": "6.11.0-1016-nvidia",
+    "architecture": "x86_64",
+    "virtualization": "KVM",
+    "cpu_model": "Intel(R) Xeon(R) Platinum 8480+",
+    "sockets": 2,
+    "cores_per_socket": 52,
+    "threads_per_core": 2,
+    "logical_cpus": 208,
+    "numa_nodes": 2,
+    "memory_tib": 1.7,
+    "swap_bytes": 0
+  },
+  "toolchain": {
+    "gcc": "11.4.0",
+    "gxx": "11.4.0",
+    "nvcc": "12.8.93",
+    "cmake": "3.31.10",
+    "ninja": "1.13.0",
+    "uv": "0.11.28",
+    "python": "3.12.13"
+  },
+  "cuda": {
+    "driver": "570.211.01",
+    "toolkit": "12.8.93",
+    "pytorch_runtime": "12.6",
+    "gpu_count": 8,
+    "gpu_model": "NVIDIA H100 80GB HBM3",
+    "gpu_memory_mib": 81559,
+    "gpu_interconnect": "NV18 full mesh"
+  },
+  "rdma": {
+    "device": "mlx5_0",
+    "firmware": "22.41.1000",
+    "pci_function": "05:00.0",
+    "pci_id": "15b3:101e",
+    "device_exposure": "mlx5Gen virtual function",
+    "port": 1,
+    "link_layer": "Ethernet/RoCE",
+    "active_mtu": 4096,
+    "gid_index": 3,
+    "ofed": "OFED-internal-24.10-2.1.8",
+    "rdma_core_package": "2410mlnx54-1.2410068",
+    "uar_mapping_requires_root": true
+  },
+  "python_environment": {
+    "torch": "2.13.0+cu126",
+    "triton": "3.8.0",
+    "numpy": "2.5.1",
+    "pybind11": "3.0.4",
+    "cuda_bindings": "12.9.4",
+    "nvshmem": "3.4.5",
+    "nccl": "2.29.3",
+    "complete_freeze": "repro/requirements.freeze.txt"
+  },
+  "gin_environment": {
+    "path": ".tools/venvs/gin",
+    "python": "3.12.13",
+    "torch": "2.14.0.dev20260711+cu126",
+    "torch_cuda": "12.6",
+    "torch_pinned_nccl": "2.29.3",
+    "nccl_override_package": "2.30.7",
+    "loaded_nccl_library": "2.30.7",
+    "triton": "3.8.0+git43422b04",
+    "complete_freeze": "repro/gin-requirements.freeze.txt",
+    "resolver_consistent_base": "repro/gin-requirements.base.txt"
+  },
+  "triton_source": {
+    "upstream": "https://github.com/triton-lang/triton.git",
+    "revision": "8d749c1660d399b71d8a115bd0aacfa7f955d65b",
+    "version": "3.8.0",
+    "modified": false,
+    "aboleth_plugin": ".build/compiler/lib/libAbolethPlugin.so"
+  },
+  "rebuild": {
+    "script": "repro/bootstrap.sh",
+    "default_max_jobs": 8,
+    "hardware_architecture": "sm_90"
+  }
+}

@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""Run a named benchmark configuration.
+
+Each preset names a runner and the parameters that make it that preset;
+anything can still be overridden from the environment or the command line.
+
+    scripts/aboleth-bench --list
+    scripts/aboleth-bench tier1-ladder --mode bandwidth -b 4K
+    MOE_ITERATIONS=64 scripts/aboleth-bench moe-exchange
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import pathlib
+import shutil
+import subprocess
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+BUILD = pathlib.Path(os.environ.get("ABOLETH_BUILD_DIR", ROOT / "build"))
+EXPERIMENTS = ROOT / "experiments"
+
+
+def env_str(name: str, default: str) -> str:
+    return os.environ.get(name, default)
+
+
+def python_runner(script: pathlib.Path, *args: object) -> list[str]:
+    interpreter = os.environ.get(
+        "ABOLETH_BENCH_PYTHON", str(ROOT / ".venv" / "bin" / "python")
+    )
+    return [interpreter, str(script), *(str(item) for item in args)]
+
+
+def build(preset: str) -> dict:
+    if preset == "moe-exchange":
+        return {
+            "command": python_runner(
+                EXPERIMENTS / "python" / "aboleth_moe_exchange.py",
+                "--remote-tokens", env_str("MOE_REMOTE_TOKENS", "64"),
+                "--hidden", env_str("MOE_HIDDEN", "32"),
+                "--warmup-iterations", env_str("MOE_WARMUP_ITERATIONS", "2"),
+                "--iterations", env_str("MOE_ITERATIONS", "10"),
+                "--transport", env_str("ABOLETH_MOE_TRANSPORT", "rdma"),
+            ),
+            "sudo": True,
+        }
+    if preset == "proxy-moe-exchange":
+        os.environ.setdefault("ABOLETH_MOE_TRANSPORT", "proxy")
+        return build("moe-exchange")
+
+    if preset == "rdma-benchmark":
+        return {
+            "command": python_runner(
+                EXPERIMENTS / "python" / "aboleth_rdma_benchmark.py",
+                "--rounds", env_str("BENCH_ROUNDS", "10000"),
+                "--warmup-rounds", env_str("BENCH_WARMUP_ROUNDS", "100"),
+                "--transfers", env_str("BENCH_TRANSFERS", "32"),
+                "--bytes", env_str("BENCH_BYTES", "256"),
+            ),
+            "sudo": True,
+            "env": {"TRITON_ALWAYS_COMPILE": "1"},
+        }
+    if preset in ("tier1-ladder", "tier1-alltoall", "tier1-compare"):
+        # Tier-1 microbenchmark suite (experiments/bench). Unrecognized
+        # aboleth-bench arguments pass straight through, so e.g.
+        # `aboleth-bench tier1-ladder --mode bandwidth -b 4K` just works.
+        # Never sudo: staged submission is the unprivileged path.
+        script = "alltoall.py" if preset == "tier1-alltoall" else "ladder.py"
+        arguments: list[str] = []
+        if preset == "tier1-compare":
+            arguments += ["--arms",
+                          env_str("TIER1_ARMS", "aboleth-generic,nvshmem"),
+                          "--interleave"]
+        return {
+            "command": python_runner(
+                EXPERIMENTS / "bench" / script, *arguments),
+            "sudo": False,
+            "env": {"PYTHONUNBUFFERED": "1"},
+        }
+
+    raise SystemExit(f"aboleth-bench: unknown preset: {preset}")
+
+
+PRESETS = (
+    "moe-exchange", "proxy-moe-exchange", "rdma-benchmark",
+    "tier1-ladder", "tier1-alltoall", "tier1-compare",
+)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("preset", nargs="?")
+    parser.add_argument("--list", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--no-sudo",
+        action="store_true",
+        help="run in the current user's context even if the preset asks for root",
+    )
+    arguments, passthrough = parser.parse_known_args()
+
+    if arguments.list or not arguments.preset:
+        for name in PRESETS:
+            print(name)
+        return 0 if arguments.list else 2
+
+    plan = build(arguments.preset)
+    command = plan["command"] + passthrough
+
+    environment = dict(os.environ)
+    environment.setdefault(
+        "PYTHONPATH",
+        f"{ROOT / 'python'}:{ROOT / 'third_party' / 'triton' / 'python' / 'triton_kernels'}",
+    )
+    plugin = BUILD / "lib" / "libAbolethPlugin.so"
+    if plugin.is_file():
+        environment.setdefault("ABOLETH_PLUGIN_PATH", str(plugin))
+        environment.setdefault("TRITON_PLUGIN_PATHS", str(plugin))
+    environment.setdefault("TRITON_CACHE_DIR", str(ROOT / ".triton" / "cache"))
+    environment.setdefault("TORCHINDUCTOR_CACHE_DIR", str(ROOT / ".torch-cache"))
+    environment.update(plan.get("env", {}))
+
+    # ABOLETH_BENCH_NO_SUDO is how the ctest wrapper says "you are already
+    # running under run-gated.sh, which handled privileges and the environment".
+    wants_sudo = plan.get("sudo", False) and not arguments.no_sudo
+    if wants_sudo and os.environ.get("ABOLETH_BENCH_NO_SUDO") != "1":
+        if shutil.which("sudo") is None:
+            return 77
+        exported = [f"{key}={value}" for key, value in environment.items()
+                    if key.startswith(("ABOLETH_", "TRITON_", "NCCL_", "NVSHMEM_",
+                                       "FI_", "EP8_", "PYTHON", "LD_LIBRARY_PATH"))]
+        command = ["sudo", "-n", "env", *exported, *command]
+
+    if arguments.dry_run:
+        print(" ".join(command))
+        return 0
+    return subprocess.run(command, env=environment).returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

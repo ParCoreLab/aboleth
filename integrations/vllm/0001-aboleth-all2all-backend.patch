@@ -1,0 +1,1043 @@
+diff --git a/vllm/__init__.py b/vllm/__init__.py
+--- a/vllm/__init__.py
++++ b/vllm/__init__.py
+@@ -6,7 +6,14 @@
+ # version library first.  Such assumption is critical for some customization.
+ from .version import __version__, __version_tuple__  # isort:skip
+ 
++import os
+ import typing
++
++if os.environ.get("VLLM_ENABLE_ABOLETH", "0") == "1":
++    # Aboleth must register its out-of-tree Triton dialect before vLLM imports
++    # triton._C.libtriton. Importing it here preserves that single-MLIR-instance
++    # invariant for every worker process.
++    import aboleth  # noqa: F401
+ 
+ # The environment variables override should be imported before any other
+ # modules to ensure that the environment variables are set before any
+diff --git a/vllm/config/parallel.py b/vllm/config/parallel.py
+--- a/vllm/config/parallel.py
++++ b/vllm/config/parallel.py
+@@ -40,6 +40,7 @@
+ DCPCommBackend = Literal["ag_rs", "a2a"]
+ EPLBCommunicatorBackend = Literal["torch_nccl", "torch_gloo", "nixl", "pynccl"]
+ All2AllBackend = Literal[
++    "aboleth",
+     "naive",
+     "pplx",
+     "deepep_high_throughput",
+@@ -188,6 +189,7 @@
+     all2all_backend: All2AllBackend = "allgather_reducescatter"
+     """All2All backend for MoE expert parallel communication. Available options:
+ 
++    - "aboleth": Use compiler-generated Aboleth communication phases
+     - "allgather_reducescatter": All2all based on allgather and reducescatter
+     - "deepep_high_throughput": Use deepep high-throughput kernels
+     - "deepep_low_latency": Use deepep low-latency kernels
+@@ -210,6 +212,7 @@
+ 
+     enable_dbo: bool = False
+     """Enable dual batch overlap for the model executor."""
++
+     ubatch_size: int = Field(default=0, ge=0)
+     """Number of ubatch size."""
+ 
+@@ -1003,6 +1006,26 @@
+         if envs.VLLM_BATCH_INVARIANT:
+             self.disable_custom_all_reduce = True
+ 
++        if self.all2all_backend == "aboleth":
++            if not self.enable_expert_parallel:
++                raise ValueError("the Aboleth backend requires expert parallelism")
++            if (
++                self.data_parallel_size < 2
++                or self.tensor_parallel_size != 1
++                or self.pipeline_parallel_size != 1
++                or self.prefill_context_parallel_size != 1
++            ):
++                raise ValueError(
++                    "the Aboleth P2P backend requires DP>=2, TP=1, PP=1, and PCP=1"
++                )
++            if (
++                self.enable_eplb
++                or self.enable_elastic_ep
++            ):
++                raise ValueError(
++                    "the first Aboleth gate requires EPLB and elastic EP "
++                    "to be disabled"
++                )
+         if (
+             self.distributed_executor_backend is not None
+             and not isinstance(self.distributed_executor_backend, str)
+diff --git a/vllm/distributed/device_communicators/all2all.py b/vllm/distributed/device_communicators/all2all.py
+--- a/vllm/distributed/device_communicators/all2all.py
++++ b/vllm/distributed/device_communicators/all2all.py
+@@ -18,7 +18,12 @@
+     has_flashinfer_nvlink_two_sided,
+ )
+ from vllm.utils.func_utils import supports_kw
+-from vllm.utils.import_utils import has_deep_ep, has_deep_ep_v2, has_mori
++from vllm.utils.import_utils import (
++    has_aboleth,
++    has_deep_ep,
++    has_deep_ep_v2,
++    has_mori,
++)
+ 
+ from .base_device_communicator import All2AllManagerBase, Cache
+ 
+@@ -1090,3 +1095,47 @@
+             for _, handle in self.handle_cache._cache.items():
+                 handle.destroy()
+             self.handle_cache._cache.clear()
++
++
++class AbolethAll2AllManager(All2AllManagerBase):
++    """Expert-parallel communication through Aboleth's runtime manager."""
++
++    def __init__(self, cpu_group, tcp_store_group=None, device_group=None):
++        assert has_aboleth(), (
++            "The Aboleth package is unavailable. Install the sibling Aboleth "
++            "checkout and set VLLM_ENABLE_ABOLETH=1 before importing vLLM."
++        )
++        super().__init__(cpu_group, tcp_store_group)
++        if self.world_size < 2 or self.world_size != self.dp_world_size:
++            raise NotImplementedError(
++                "Aboleth requires matching EP/DP groups with at least two ranks"
++            )
++        if self.tp_group.world_size != 1:
++            raise NotImplementedError(
++                "the first Aboleth gate requires tensor parallel size one"
++            )
++        import aboleth
++        from aboleth.integrations.compiled_vllm import AbolethMoERuntimeManager
++
++        self._runtime = AbolethMoERuntimeManager(
++            rank=self.rank,
++            world_size=self.world_size,
++            device=torch.cuda.current_device(),
++            bootstrap=aboleth.TorchDistributedBootstrap(cpu_group),
++            internode=self.internode,
++        )
++
++    def get_handle(self, kwargs):
++        config = get_current_vllm_config().parallel_config
++        consumer_kwargs = dict(kwargs)
++        if consumer_kwargs.get("quant_dtype") is not None:
++            from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
++            consumer_kwargs["quant_round_scale"] = is_deep_gemm_e8m0_used()
++        return self._runtime.get_handle(
++            consumer_kwargs,
++            num_slots=config.num_ubatches if config.use_ubatching else 1,
++            placement_strategy=config.expert_placement_strategy,
++        )
++
++    def destroy(self):
++        self._runtime.close()
+diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -168,6 +168,14 @@
+                 from .all2all import DeepEPV2All2AllManager
+ 
+                 self.all2all_manager = DeepEPV2All2AllManager(
++                    self.cpu_group,
++                    tcp_store_group,
++                    device_group=self.device_group,
++                )
++            elif self.all2all_backend == "aboleth":
++                from .all2all import AbolethAll2AllManager
++
++                self.all2all_manager = AbolethAll2AllManager(
+                     self.cpu_group,
+                     tcp_store_group,
+                     device_group=self.device_group,
+diff --git a/vllm/distributed/device_communicators/pynccl_wrapper.py b/vllm/distributed/device_communicators/pynccl_wrapper.py
+--- a/vllm/distributed/device_communicators/pynccl_wrapper.py
++++ b/vllm/distributed/device_communicators/pynccl_wrapper.py
+@@ -54,6 +54,9 @@
+ # NCCL 2.30+ ncclCommProperties_t. Only fields through ginType are read;
+ # trailing fields keep the layout aligned with NCCL's versioned structure.
+ class ncclCommProperties(ctypes.Structure):
++    # This declaration is the 2.30.4 layout, even with a newer library.
++    ABI_VERSION = 23004
++
+     _fields_ = [
+         ("size", ctypes.c_size_t),
+         ("magic", ctypes.c_uint),
+diff --git a/vllm/distributed/kv_transfer/kv_connector/factory.py b/vllm/distributed/kv_transfer/kv_connector/factory.py
+--- a/vllm/distributed/kv_transfer/kv_connector/factory.py
++++ b/vllm/distributed/kv_transfer/kv_connector/factory.py
+@@ -192,6 +192,12 @@
+ )
+ 
+ KVConnectorFactory.register_connector(
++    "AbolethConnector",
++    "vllm.distributed.kv_transfer.kv_connector.v1.aboleth_connector",
++    "AbolethConnector",
++)
++
++KVConnectorFactory.register_connector(
+     "MultiConnector",
+     "vllm.distributed.kv_transfer.kv_connector.v1.multi_connector",
+     "MultiConnector",
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/aboleth_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/aboleth_connector.py
+new file mode 100644
+--- /dev/null
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/aboleth_connector.py
+@@ -0,0 +1,290 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Same-node TP1 KV transfer through compiled Aboleth P2P phases."""
++
++from __future__ import annotations
++
++from typing import TYPE_CHECKING
++
++import torch
++
++from aboleth.integrations import VLLMKVPeerRuntime
++from aboleth.kv import (
++    CompiledKVTransferManager,
++    KVCompletionNotification,
++    KVRuntimeOverrides,
++)
++from vllm.distributed.kv_transfer.kv_connector.v1.base import (
++    KVConnectorRole,
++)
++from vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector import (
++    NixlBaseConnector,
++)
++from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
++    NixlConnectorMetadata,
++)
++from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_scheduler import (
++    NixlPullConnectorScheduler,
++)
++from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker import (
++    NixlPullConnectorWorker,
++)
++from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
++    ReadSpec,
++)
++
++if TYPE_CHECKING:
++    from vllm.config import VllmConfig
++    from vllm.v1.kv_cache_interface import KVCacheConfig
++
++
++class AbolethKVConnectorWorker(NixlPullConnectorWorker):
++    def __init__(
++        self,
++        vllm_config: "VllmConfig",
++        engine_id: str,
++        kv_cache_config: "KVCacheConfig",
++    ):
++        self._aboleth: VLLMKVPeerRuntime | None = None
++        super().__init__(
++            vllm_config,
++            engine_id,
++            kv_cache_config,
++        )
++        config = vllm_config.kv_transfer_config
++        assert config is not None
++        rank = config.kv_rank
++        if rank is None:
++            rank = (
++                0
++                if config.kv_role == "kv_producer"
++                else 1
++            )
++        world_size = (
++            2
++            if config.kv_parallel_size == 1
++            else config.kv_parallel_size
++        )
++        if world_size != 2:
++            raise NotImplementedError(
++                "AbolethConnector currently supports 1P1D"
++            )
++        port = config.get_from_extra_config(
++            "aboleth_store_port",
++            config.kv_port + 1000,
++        )
++        self._aboleth = VLLMKVPeerRuntime(
++            rank=rank,
++            world_size=world_size,
++            device=torch.cuda.current_device(),
++            host=config.kv_ip,
++            port=int(port),
++            overrides=KVRuntimeOverrides.from_mapping(
++                config.kv_connector_extra_config or {}
++            ),
++        )
++        self._aboleth_done: set[str] = set()
++        self._aboleth_manager = CompiledKVTransferManager(
++            self._aboleth
++        )
++
++    @property
++    def has_active_layer_events(self) -> bool:
++        return self._aboleth_manager.has_active_layers
++
++    def register_kv_caches(
++        self,
++        kv_caches: dict[str, torch.Tensor],
++    ):
++        super().register_kv_caches(kv_caches)
++        assert self._aboleth is not None
++        self._aboleth.register_kv_caches(
++            kv_caches,
++            consumer_order=tuple(kv_caches),
++        )
++
++    def start_load_kv(
++        self,
++        metadata: NixlConnectorMetadata,
++    ):
++        activated = self._aboleth_manager.begin_step(
++            set(metadata.reqs_not_processed)
++        )
++        if (
++            activated
++            and self._aboleth is not None
++            and self._aboleth.profile_transfers
++        ):
++            print(
++                "aboleth_kv_pipeline="
++                f"requests={activated} "
++                f"layers={self._aboleth_manager.active_layer_count}",
++                flush=True,
++            )
++        super().start_load_kv(metadata)
++
++    def wait_for_layer_load(self, layer_name: str):
++        stream = torch.cuda.current_stream()
++        self._aboleth_manager.wait_for_layer(
++            layer_name,
++            stream.wait_event,
++        )
++
++    def _read_blocks(
++        self,
++        read_spec: ReadSpec,
++        dst_engine_id: str,
++        request_id: str,
++        remote_request_id: str,
++        local_xfer_side_handle: int,
++        remote_xfer_side_handle: int,
++    ):
++        del local_xfer_side_handle, remote_xfer_side_handle
++        assert self.transfer_topo is not None
++        remote_info = self.transfer_topo.get_engine_info(
++            dst_engine_id
++        )
++        if (
++            self.world_size != 1
++            or remote_info.remote_tp_size != 1
++            or self.pp_size != 1
++            or len(read_spec.local_block_ids) != 1
++            or len(read_spec.remote_block_ids) != 1
++            or remote_info.remote_block_size != self.block_size
++            or remote_info.remote_physical_blocks_per_logical != 1
++            or self._physical_blocks_per_logical_kv_block != 1
++        ):
++            raise NotImplementedError(
++                "first Aboleth KV gate requires homogeneous TP1/PP1"
++            )
++        local_block_ids = list(
++            read_spec.local_block_ids[0]
++        )
++        remote_block_ids = list(
++            read_spec.remote_block_ids[0]
++        )
++        local_groups = [local_block_ids]
++        remote_groups = [remote_block_ids]
++        local_groups, remote_groups = (
++            self._apply_prefix_caching(
++                local_groups,
++                remote_groups,
++                1,
++            )
++        )
++        local_block_ids = local_groups[0]
++        remote_block_ids = remote_groups[0]
++        notif_id = (
++            f"{remote_request_id}:{self.world_size}"
++        ).encode()
++        agent_name = self._remote_agents[
++            dst_engine_id
++        ][(0, read_spec.remote_rank)]
++        assert self._aboleth is not None
++        tracked = self._aboleth_manager.start_transfer(
++            request_id=request_id,
++            local_block_ids=local_block_ids,
++            remote_block_ids=remote_block_ids,
++            remote_rank=1 - self._aboleth.rank,
++            notification=KVCompletionNotification(
++                target=agent_name,
++                payload=notif_id,
++            ),
++        )
++        if tracked:
++            self._recving_transfers.setdefault(
++                request_id,
++                [],
++            )
++        else:
++            self.nixl_wrapper.send_notif(
++                agent_name,
++                notif_msg=notif_id,
++            )
++            self._aboleth_done.add(request_id)
++
++    def _pop_done_transfers(self, transfers):
++        if transfers is self._recving_transfers:
++            done = set(self._aboleth_done)
++            self._aboleth_done.clear()
++            poll = self._aboleth_manager.poll()
++            done.update(poll.ready_request_ids)
++            for notification in poll.notifications:
++                self.nixl_wrapper.send_notif(
++                    notification.target,
++                    notif_msg=notification.payload,
++                )
++            for request_id in done:
++                transfers.pop(request_id, None)
++            return done
++        return super()._pop_done_transfers(transfers)
++
++    def shutdown(self):
++        if self._aboleth is not None:
++            self._aboleth.close()
++            self._aboleth = None
++        super().shutdown()
++
++
++class AbolethConnector(NixlBaseConnector):
++    """NIXL control plane with Aboleth compiled KV data movement."""
++
++    @classmethod
++    def requires_piecewise_for_cudagraph(
++        cls,
++        extra_config,
++    ) -> bool:
++        del extra_config
++        return True
++
++    def __init__(
++        self,
++        vllm_config: "VllmConfig",
++        role: KVConnectorRole,
++        kv_cache_config: "KVCacheConfig",
++    ):
++        super().__init__(
++            vllm_config,
++            role,
++            kv_cache_config,
++        )
++        if role == KVConnectorRole.SCHEDULER:
++            self.connector_scheduler = (
++                NixlPullConnectorScheduler(
++                    vllm_config,
++                    self.engine_id,
++                    kv_cache_config,
++                )
++            )
++        elif role == KVConnectorRole.WORKER:
++            self.connector_worker = AbolethKVConnectorWorker(
++                vllm_config,
++                self.engine_id,
++                kv_cache_config,
++            )
++        else:
++            raise ValueError(
++                f"unsupported connector role: {role}"
++            )
++
++    def wait_for_layer_load(self, layer_name: str):
++        worker = self.connector_worker
++        if (
++            isinstance(worker, AbolethKVConnectorWorker)
++            and worker.has_active_layer_events
++        ):
++            worker.wait_for_layer_load(layer_name)
++
++    def start_load_kv(self, forward_context, **kwargs):
++        del forward_context, kwargs
++        assert self.connector_worker is not None
++        assert isinstance(
++            self.connector_worker,
++            AbolethKVConnectorWorker,
++        )
++        assert isinstance(
++            self._connector_metadata,
++            NixlConnectorMetadata,
++        )
++        self.connector_worker.start_load_kv(
++            self._connector_metadata
++        )
+diff --git a/vllm/envs.py b/vllm/envs.py
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -185,6 +185,7 @@
+     VLLM_V1_USE_OUTLINES_CACHE: bool = False
+     VLLM_TPU_USING_PATHWAYS: bool = False
+     VLLM_USE_DEEP_GEMM: bool = True
++    VLLM_ENABLE_ABOLETH: bool = False
+     VLLM_MOE_USE_DEEP_GEMM: bool = True
+     VLLM_USE_DEEP_GEMM_E8M0: bool = True
+     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
+@@ -1491,6 +1492,7 @@
+     ),
+     # Allow use of DeepGemm kernels for fused moe ops.
+     "VLLM_USE_DEEP_GEMM": lambda: bool(int(os.getenv("VLLM_USE_DEEP_GEMM", "1"))),
++    "VLLM_ENABLE_ABOLETH": lambda: bool(int(os.getenv("VLLM_ENABLE_ABOLETH", "0"))),
+     # Allow use of DeepGemm specifically for MoE fused ops (overrides only MoE).
+     "VLLM_MOE_USE_DEEP_GEMM": lambda: bool(
+         int(os.getenv("VLLM_MOE_USE_DEEP_GEMM", "1"))
+diff --git a/vllm/model_executor/layers/fused_moe/all2all_utils.py b/vllm/model_executor/layers/fused_moe/all2all_utils.py
+--- a/vllm/model_executor/layers/fused_moe/all2all_utils.py
++++ b/vllm/model_executor/layers/fused_moe/all2all_utils.py
+@@ -31,6 +31,7 @@
+ )
+ from vllm.platforms import current_platform
+ from vllm.utils.import_utils import (
++    has_aboleth,
+     has_deep_ep,
+     has_deep_ep_v2,
+     has_mori,
+@@ -40,6 +41,8 @@
+ logger = init_logger(__name__)
+ 
+ if current_platform.is_cuda_alike():
++    if has_aboleth():
++        from .prepare_finalize.aboleth import AbolethPrepareAndFinalize
+     if has_deep_ep():
+         from .prepare_finalize.deepep_ht import DeepEPHTPrepareAndFinalize
+         from .prepare_finalize.deepep_ll import (
+@@ -170,7 +173,34 @@
+ 
+     prepare_finalize: FusedMoEPrepareAndFinalize | None = None
+ 
+-    if moe.use_deepep_ht_kernels:
++    if moe.use_aboleth_kernels:
++        all_to_all_args = dict(
++            num_max_tokens_per_rank=moe.max_num_tokens,
++            hidden=moe.hidden_dim,
++            num_topk=moe.experts_per_token,
++            num_experts=moe.num_experts,
++            num_local_experts=moe.num_local_experts,
++            dtype=moe.in_dtype,
++            quant_dtype=(
++                quant_config.quant_dtype
++                if quant_config is not None
++                else None
++            ),
++            quant_block_shape=(
++                tuple(quant_config.block_shape)
++                if quant_config is not None
++                and quant_config.block_shape is not None
++                else None
++            ),
++        )
++        handle = all2all_manager.get_handle(all_to_all_args)
++        prepare_finalize = AbolethPrepareAndFinalize(
++            handle,
++            rank_expert_offset=(all2all_manager.rank * moe.num_local_experts),
++            layer_name=moe.layer_name,
++        )
++
++    elif moe.use_deepep_ht_kernels:
+         assert moe.dp_size == all2all_manager.dp_world_size
+ 
+         all_to_all_args: dict[str, Any] = dict()
+diff --git a/vllm/model_executor/layers/fused_moe/config.py b/vllm/model_executor/layers/fused_moe/config.py
+--- a/vllm/model_executor/layers/fused_moe/config.py
++++ b/vllm/model_executor/layers/fused_moe/config.py
+@@ -1109,6 +1109,10 @@
+     def use_deepep_v2_kernels(self):
+         return self.use_all2all_kernels and self.all2all_backend == "deepep_v2"
+ 
++    @property
++    def use_aboleth_kernels(self):
++        return self.use_all2all_kernels and self.all2all_backend == "aboleth"
++
+     @staticmethod
+     def flatten_tp_across_dp_and_pcp(
+         tp_size: int, dp_size: int, dp_rank: int, pcp_size: int, pcp_rank: int
+@@ -1300,6 +1304,7 @@
+     max_num_tokens: int = SchedulerConfig.DEFAULT_MAX_NUM_BATCHED_TOKENS_FOR_BATCHED_DP
+     has_bias: bool = False
+     is_lora_enabled: bool = False
++    layer_name: str = ""
+ 
+     # When True, the MoE skips its final cross-rank all-reduce (and the separate
+     # shared-expert reduce), returning the partial per-rank sum. The caller is
+@@ -1452,5 +1457,9 @@
+         return self.moe_parallel_config.use_deepep_v2_kernels
+ 
+     @property
++    def use_aboleth_kernels(self):
++        return self.moe_parallel_config.use_aboleth_kernels
++
++    @property
+     def needs_round_robin_routing_tables(self):
+         return self.moe_parallel_config.needs_round_robin_routing_tables
+diff --git a/vllm/model_executor/layers/fused_moe/expert_map_manager.py b/vllm/model_executor/layers/fused_moe/expert_map_manager.py
+--- a/vllm/model_executor/layers/fused_moe/expert_map_manager.py
++++ b/vllm/model_executor/layers/fused_moe/expert_map_manager.py
+@@ -119,10 +119,14 @@
+     num_expert_group: int | None,
+     num_redundant_experts: int,
+     enable_eplb: bool,
++    allow_direct_expert_map: bool = False,
+ ) -> ExpertPlacementStrategy:
+     if expert_placement_strategy == "round_robin":
+         round_robin_supported = (
+-            (num_expert_group is not None and num_expert_group > 1)
++            (
++                allow_direct_expert_map
++                or (num_expert_group is not None and num_expert_group > 1)
++            )
+             and num_redundant_experts == 0
+             and not enable_eplb
+         )
+@@ -137,6 +141,7 @@
+         if (
+             moe_parallel_config.use_all2all_kernels
+             and not moe_parallel_config.needs_round_robin_routing_tables
++            and not allow_direct_expert_map
+         ):
+             logger.warning(
+                 "Round-robin expert placement currently only supports "
+@@ -190,6 +195,8 @@
+         moe_parallel_config: FusedMoEParallelConfig,
+         placement_strategy: ExpertPlacementStrategy,
+         enable_eplb: bool,
++        allow_direct_expert_map: bool = False,
++        layer_name: str = "",
+         num_fused_shared_experts: int = 0,
+         rocm_aiter_enabled: bool = False,
+     ):
+@@ -208,6 +215,8 @@
+         self.moe_parallel_config = moe_parallel_config
+         self.num_fused_shared_experts = num_fused_shared_experts
+         self.rocm_aiter_enabled = rocm_aiter_enabled
++        self.allow_direct_expert_map = allow_direct_expert_map
++        self.layer_name = layer_name
+         self.top_k = top_k
+         self.max_num_batched_tokens = max_num_batched_tokens
+ 
+@@ -219,6 +228,7 @@
+                 num_expert_group=num_expert_group,
+                 num_redundant_experts=num_redundant_experts,
+                 enable_eplb=enable_eplb,
++                allow_direct_expert_map=allow_direct_expert_map,
+             )
+ 
+         # Determine effective placement strategy
+@@ -428,6 +438,7 @@
+         if (
+             self.moe_parallel_config.use_all2all_kernels
+             and not self.moe_parallel_config.needs_round_robin_routing_tables
++            and not self.allow_direct_expert_map
+         ):
+             logger.warning(
+                 "Round-robin placement requires DeepEP-ll or NIXL backend. "
+diff --git a/vllm/model_executor/layers/fused_moe/layer.py b/vllm/model_executor/layers/fused_moe/layer.py
+--- a/vllm/model_executor/layers/fused_moe/layer.py
++++ b/vllm/model_executor/layers/fused_moe/layer.py
+@@ -276,6 +276,11 @@
+         moe_parallel_config=moe_parallel_config,
+         placement_strategy=vllm_config.parallel_config.expert_placement_strategy,
+         enable_eplb=eplb_state is not None,
++        allow_direct_expert_map=(
++            vllm_config.parallel_config.all2all_backend
++            == "aboleth"
++        ),
++        layer_name=layer_name,
+         num_fused_shared_experts=num_fused_shared_experts,
+         rocm_aiter_enabled=rocm_aiter_ops.is_fused_moe_enabled() and is_act_and_mul,
+     )
+@@ -349,6 +354,7 @@
+         max_num_tokens=max_num_batched_tokens,
+         has_bias=has_bias,
+         is_lora_enabled=vllm_config.lora_config is not None,
++        layer_name=layer_name,
+         activation=moe_activation,
+         device=vllm_config.device_config.device,
+         routing_method=router.routing_method_type,  # Not ideal
+diff --git a/vllm/model_executor/layers/fused_moe/modular_kernel.py b/vllm/model_executor/layers/fused_moe/modular_kernel.py
+--- a/vllm/model_executor/layers/fused_moe/modular_kernel.py
++++ b/vllm/model_executor/layers/fused_moe/modular_kernel.py
+@@ -245,6 +245,10 @@
+         """
+         return False
+ 
++    def expert_output_alias(self, expert_input: torch.Tensor) -> torch.Tensor | None:
++        """Optional physical destination for the unchanged expert kernel."""
++        return None
++
+     def on_commit(self) -> None:
+         """
+         Runs after this prepare/finalize has been committed to the active
+@@ -1491,6 +1495,7 @@
+         if lora_ctx is not None:
+             lora_ctx.original_hidden_states = hidden_states
+ 
++        expert_output_alias = self.prepare_finalize.expert_output_alias(a1q)
+         fused_out = self._fused_experts(
+             in_dtype=hidden_states.dtype,
+             a1q=a1q,
+@@ -1505,7 +1510,7 @@
+             expert_map=expert_map,
+             apply_router_weight_on_input=apply_router_weight_on_input,
+             expert_tokens_meta=expert_tokens_meta,
+-            output_alias=output,
++            output_alias=output if expert_output_alias is None else expert_output_alias,
+         )
+ 
+         if lora_ctx is not None:
+diff --git a/vllm/model_executor/layers/fused_moe/prepare_finalize/aboleth.py b/vllm/model_executor/layers/fused_moe/prepare_finalize/aboleth.py
+new file mode 100644
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/prepare_finalize/aboleth.py
+@@ -0,0 +1,251 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from aboleth.integrations.compiled_vllm import ModularMoERuntime
++import torch
++
++import vllm.model_executor.layers.fused_moe.modular_kernel as mk
++from vllm.forward_context import (
++    get_forward_context,
++    is_forward_context_available,
++)
++from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
++from vllm.v1.worker.ubatching import (
++    dbo_current_ubatch_id,
++    dbo_enabled,
++    dbo_switch_to_comm,
++    dbo_switch_to_compute,
++    dbo_switch_to_compute_sync,
++    dbo_yield_and_switch_from_compute_to_comm,
++    dbo_yield_and_switch_from_comm_to_compute,
++)
++
++__all__ = [
++    "AbolethPrepareAndFinalize",
++]
++
++
++def _record_handoff_tensors(*tensors):
++    # Tensor storage can outlive its last Python reference on another stream.
++    # Endpoint storage is persistent; temporary route/weight tensors are not.
++    if dbo_enabled():
++        stream = torch.cuda.current_stream()
++        for tensor in tensors:
++            if tensor is not None and tensor.is_cuda:
++                tensor.record_stream(stream)
++
++
++def _record_prepared_tensors(prepared):
++    x, scale, metadata, ids, weights = prepared
++    _record_handoff_tensors(x, scale, ids, weights)
++    if metadata is not None:
++        _record_handoff_tensors(metadata.expert_num_tokens)
++
++
++class AbolethPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
++    def __init__(
++        self,
++        handle,
++        *,
++        rank_expert_offset: int = 0,
++        layer_name: str = "",
++    ):
++        super().__init__()
++        self._async_enabled = handle.slots > 1
++        self._runtime = ModularMoERuntime(
++            handle,
++            rank_expert_offset=rank_expert_offset,
++            layer_name=layer_name,
++            slot_provider=dbo_current_ubatch_id,
++        )
++
++    def num_dispatchers(self) -> int:
++        return self._runtime.num_dispatchers()
++
++    def output_is_reduced(self) -> bool:
++        return self._runtime.output_is_reduced()
++
++    @property
++    def activation_format(self) -> mk.FusedMoEActivationFormat:
++        return mk.FusedMoEActivationFormat.Standard
++
++    def max_num_tokens_per_rank(self) -> int | None:
++        return self._runtime.max_num_tokens_per_rank()
++
++    def topk_indices_dtype(self) -> torch.dtype | None:
++        return self._runtime.topk_indices_dtype()
++
++    def expert_output_alias(
++        self,
++        expert_input: torch.Tensor,
++    ) -> torch.Tensor | None:
++        return self._runtime.expert_output_alias(expert_input)
++
++
++    def _wave_uniform_tokens(self, required_tokens: int) -> int:
++        """Agree once per forward on the bound used to select a shape variant.
++
++        Idle DP ranks may carry dummy local token counts. A CPU maximum keeps
++        every rank in the same communication variant; graph sizes already agree.
++        """
++        if not getattr(self._runtime, "has_decode_sibling", False):
++            return required_tokens
++        if torch.cuda.is_current_stream_capturing():
++            return required_tokens
++        from vllm.distributed.parallel_state import get_dp_group
++
++        try:
++            group = get_dp_group()
++        except AssertionError:
++            return required_tokens
++        if group.world_size <= 1:
++            return required_tokens
++        context = (
++            get_forward_context()
++            if is_forward_context_available()
++            else None
++        )
++        # Keyed per micro-batch: under dual-batch overlap the two
++        # ubatches of one forward have independent token bounds, and
++        # reusing ubatch 0's max for ubatch 1 would re-open the
++        # divergence for a prefill that only ubatch 1 carries.
++        cache_key = f"_aboleth_wave_tokens_{dbo_current_ubatch_id()}"
++        cached = (
++            getattr(context, cache_key, None)
++            if context is not None
++            else None
++        )
++        if cached is not None:
++            # cached is the max over every rank's bound for this wave
++            # and ubatch, so it dominates all locals; returning it
++            # unmixed is what keeps the selection rank-uniform.
++            return cached
++        bound = torch.tensor([required_tokens], dtype=torch.int64)
++        torch.distributed.all_reduce(
++            bound,
++            op=torch.distributed.ReduceOp.MAX,
++            group=group.cpu_group,
++        )
++        wave_tokens = int(bound.item())
++        if context is not None:
++            try:
++                setattr(context, cache_key, wave_tokens)
++            except AttributeError:
++                pass
++        return wave_tokens
++
++    def prepare(
++        self,
++        a1: torch.Tensor,
++        topk_weights: torch.Tensor,
++        topk_ids: torch.Tensor,
++        num_experts: int,
++        expert_map: torch.Tensor | None,
++        apply_router_weight_on_input: bool,
++        quant_config: FusedMoEQuantConfig,
++        defer_input_quant: bool = False,
++    ) -> mk.PrepareResultType:
++        actual_tokens = int(a1.shape[0])
++        dp_metadata = (
++            get_forward_context().dp_metadata
++            if is_forward_context_available()
++            else None
++        )
++        required_tokens = max(
++            actual_tokens,
++            (
++                int(dp_metadata.num_tokens_across_dp_cpu.max())
++                if dp_metadata is not None
++                else actual_tokens
++            ),
++        )
++        required_tokens = self._wave_uniform_tokens(required_tokens)
++        prepared = self._runtime.prepare(
++            a1,
++            topk_weights,
++            topk_ids,
++            num_experts=num_experts,
++            expert_map=expert_map,
++            apply_router_weight_on_input=apply_router_weight_on_input,
++            required_tokens=required_tokens,
++            quantized_input=quant_config.quant_dtype is not None,
++            defer_input_quant=defer_input_quant,
++        )
++        expert_tokens_meta = (
++            mk.ExpertTokensMetadata(
++                expert_num_tokens=prepared.local_counts,
++                expert_num_tokens_cpu=None,
++            )
++            if prepared.local_counts is not None
++            else None
++        )
++        return (
++            prepared.expert_input,
++            prepared.scales,
++            expert_tokens_meta,
++            prepared.global_ids,
++            prepared.expert_weights,
++        )
++
++    def finalize(
++        self,
++        output: torch.Tensor,
++        fused_expert_output: torch.Tensor,
++        topk_weights: torch.Tensor,
++        topk_ids: torch.Tensor,
++        apply_router_weight_on_input: bool,
++        weight_and_reduce_impl: mk.TopKWeightAndReduce,
++    ) -> None:
++        self._runtime.finalize(output, fused_expert_output)
++
++    def supports_async(self) -> bool:
++        return self._async_enabled
++
++    def prepare_async(
++        self,
++        a1: torch.Tensor,
++        topk_weights: torch.Tensor,
++        topk_ids: torch.Tensor,
++        num_experts: int,
++        expert_map: torch.Tensor | None,
++        apply_router_weight_on_input: bool,
++        quant_config: FusedMoEQuantConfig,
++        defer_input_quant: bool = False,
++    ) -> mk.ReceiverType:
++        # The helper records this microbatch's input-ready event before
++        # yielding, then puts communication on the engine's comm stream.
++        dbo_yield_and_switch_from_compute_to_comm()
++        _record_handoff_tensors(a1, topk_weights, topk_ids)
++        prepared = self.prepare(
++            a1, topk_weights, topk_ids, num_experts, expert_map,
++            apply_router_weight_on_input, quant_config, defer_input_quant,
++        )
++        dbo_switch_to_compute_sync()
++        _record_prepared_tensors(prepared)
++        return lambda: prepared
++
++    def finalize_async(
++        self,
++        output: torch.Tensor,
++        fused_expert_output: torch.Tensor,
++        topk_weights: torch.Tensor,
++        topk_ids: torch.Tensor,
++        apply_router_weight_on_input: bool,
++        weight_and_reduce_impl: mk.TopKWeightAndReduce,
++    ):
++        dbo_yield_and_switch_from_compute_to_comm()
++        _record_handoff_tensors(output, fused_expert_output)
++        self.finalize(
++            output, fused_expert_output, topk_weights, topk_ids,
++            apply_router_weight_on_input, weight_and_reduce_impl,
++        )
++        # The engine may enqueue shared-expert computation before calling
++        # this receiver, matching its existing DeepEP HT handoff contract.
++        dbo_switch_to_compute()
++
++        def receive():
++            dbo_switch_to_comm()
++            dbo_yield_and_switch_from_comm_to_compute()
++            _record_handoff_tensors(output)
++
++        return receive
+diff --git a/vllm/utils/import_utils.py b/vllm/utils/import_utils.py
+--- a/vllm/utils/import_utils.py
++++ b/vllm/utils/import_utils.py
+@@ -58,10 +58,22 @@
+ @cache
+ def import_triton_kernels():
+     """
+-    For convenience, prioritize triton_kernels that is available in
+-    `site-packages`. Use `vllm.third_party.triton_kernels` as a fall-back.
+-    """
+-    if _has_module("triton_kernels"):
++    Prefer a complete site-package install. An older Triton checkout may expose
++    a partial `triton_kernels` package without the `matmul_ogs` API vLLM needs;
++    in that case use vLLM's bundled copy rather than treating the partial
++    package as authoritative.
++    """
++    try:
++        external_available = _has_module("triton_kernels")
++        external_complete = (
++            external_available
++            and importlib.util.find_spec("triton_kernels.matmul_ogs") is not None
++        )
++    except (ImportError, ModuleNotFoundError, ValueError):
++        external_available = False
++        external_complete = False
++
++    if external_complete:
+         import triton_kernels
+ 
+         logger.debug_once(
+@@ -74,6 +86,13 @@
+             f"Loading module triton_kernels from {triton_kernels.__file__}.",
+         )
+         sys.modules["triton_kernels"] = triton_kernels
++    elif external_available:
++        import triton_kernels
++
++        logger.debug_once(
++            "Loading an older partial triton_kernels package because no "
++            "bundled fallback is available.",
++        )
+     else:
+         logger.info_once(
+             "triton_kernels unavailable in this build. "
+@@ -415,6 +434,11 @@
+ def has_deep_ep() -> bool:
+     """Whether the optional `deep_ep` package is available."""
+     return _has_module("deep_ep")
++
++
++def has_aboleth() -> bool:
++    """Whether the optional Aboleth compiler/runtime package is available."""
++    return _has_module("aboleth")
+ 
+ 
+ DEEPEP_V2_MIN_NCCL_VERSION_RAW = 23004  # 2.30.4
+diff --git a/vllm/utils/nccl.py b/vllm/utils/nccl.py
+--- a/vllm/utils/nccl.py
++++ b/vllm/utils/nccl.py
+@@ -114,7 +114,9 @@
+         ctypes.memset(ctypes.addressof(props), 0, ctypes.sizeof(props))
+         props.size = ctypes.sizeof(props)
+         props.magic = 0xCAFEBEEF
+-        props.version = nccl.ncclGetRawVersion()
++        # NCCL chooses writable fields by the declared structure version.
++        # A runtime-version claim with this shorter layout corrupts memory.
++        props.version = min(nccl.ncclGetRawVersion(), props.ABI_VERSION)
+         result = query_fn(ctypes.c_void_p(comm_ptr), ctypes.byref(props))
+     except Exception:
+         logger.warning("Failed to query NCCL communicator properties", exc_info=True)
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -6481,6 +6481,12 @@
+                         for i, output in enumerate(dummy_encoder_outputs):
+                             self.encoder_cache[f"tmp_{i}"] = output
+ 
++        # Profile the valid full-batch path before locking expert workspaces.
++        if self.parallel_config.use_ubatching:
++            self._dummy_run(
++                self.max_num_tokens, is_profile=True, allow_microbatching=False
++            )
++
+         # Add `is_profile` here to pre-allocate communication buffers
+         hidden_states, last_hidden_states = self._dummy_run(
+             self.max_num_tokens, is_profile=True

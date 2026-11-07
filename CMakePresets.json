@@ -1,0 +1,85 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "Python_EXECUTABLE": "${sourceDir}/.venv/bin/python"
+      }
+    },
+    {
+      "name": "default",
+      "inherits": "base",
+      "displayName": "Everything the machine can build",
+      "description": "Every component AUTO: each is enabled if its dependencies are present."
+    },
+    {
+      "name": "full",
+      "inherits": "base",
+      "displayName": "Full build, dependencies required",
+      "description": "Every component ON: configuration fails rather than silently dropping one.",
+      "cacheVariables": {
+        "ABOLETH_ENABLE_TRITON_PLUGIN": "ON",
+        "ABOLETH_ENABLE_RUNTIME": "ON",
+        "ABOLETH_ENABLE_VERBS": "ON",
+        "ABOLETH_ENABLE_PYTHON": "ON",
+        "ABOLETH_ENABLE_EXPERIMENTS": "ON"
+      }
+    },
+    {
+      "name": "compiler-only",
+      "inherits": "base",
+      "displayName": "Compiler core, no GPU or transport toolchain",
+      "description": "AbolethIR + AbolethScheduling from C++17 and MLIR alone. No CUDA, Triton, verbs or libfabric probe runs.",
+      "binaryDir": "${sourceDir}/build-compiler-only",
+      "cacheVariables": {
+        "ABOLETH_GPU_BACKEND": "NONE",
+        "ABOLETH_ENABLE_TRITON_PLUGIN": "OFF",
+        "ABOLETH_ENABLE_RUNTIME": "OFF",
+        "ABOLETH_ENABLE_VERBS": "OFF",
+        "ABOLETH_ENABLE_EFA": "OFF",
+        "ABOLETH_ENABLE_PYTHON": "OFF",
+        "ABOLETH_ENABLE_EXPERIMENTS": "OFF",
+        "ABOLETH_ENABLE_NVSHMEM_BENCHMARKS": "OFF",
+        "ABOLETH_ENABLE_NCCL_GIN_BENCHMARKS": "OFF",
+        "ABOLETH_ENABLE_TESTS": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "default", "configurePreset": "default" },
+    { "name": "full", "configurePreset": "full" },
+    { "name": "compiler-only", "configurePreset": "compiler-only" }
+  ],
+  "testPresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "configurePreset": "default",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "quick",
+      "inherits": "base",
+      "displayName": "Compiler, goldens and Python tests",
+      "filter": { "include": { "label": "compiler-ir|goldens|python|lint" } }
+    },
+    {
+      "name": "smoke",
+      "inherits": "base",
+      "displayName": "Everything that runs without root",
+      "filter": { "include": { "label": "compiler-ir|goldens|python|lint|smoke" } }
+    },
+    {
+      "name": "all",
+      "inherits": "base",
+      "displayName": "Full suite including hardware-gated tests"
+    }
+  ]
+}

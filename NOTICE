@@ -1,0 +1,16 @@
+Aboleth
+Copyright 2026 The Aboleth Authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It includes third-party files, each under its own license:
+
+- src/runtime/rdma/vendor/mlx5_ifc.h: Mellanox Technologies, dual-licensed
+  GPL-2.0 or OpenIB.org BSD; used under the OpenIB.org BSD license.
+- src/runtime/rdma/vendor/mlx5_prm.h: 6WIND S.A. and Mellanox Technologies,
+  BSD-3-Clause.
+- src/runtime/hip/vendor/ionic_dv.h: Advanced Micro Devices, Inc.,
+  GPL-2.0 OR Linux-OpenIB; used under the Linux-OpenIB (BSD) license.
+
+Git submodules (not part of this distribution): third_party/triton (MIT),
+third_party/efa-dp-direct (see its repository).
