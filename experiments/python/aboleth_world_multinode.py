@@ -424,7 +424,10 @@ def run_stage_a(world: World, bootstrap) -> list[str]:
     for peer, host in hosts.items():
         if not host:
             topology_failures.append(f"rank {peer} sent no hostname")
-        elif world.topology[peer].hostname != host:
+        # The topology names a node "<hostname>:<boot id>" where the boot ID
+        # is readable (world._local_node_identity); the bootstrap sent only
+        # the hostname.
+        elif world.topology[peer].hostname.partition(":")[0] != host:
             topology_failures.append(
                 f"rank {peer} bootstrapped as {host} but its "
                 f"topology bundle says "
